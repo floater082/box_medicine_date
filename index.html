@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>부모님용 유통기한 돋보기 (Web AI)</title>
+    <style>
+      body {
+        font-family: 'Malgun Gothic', sans-serif;
+        text-align: center;
+        background-color: #f4f4f9;
+        margin: 0;
+        padding: 10px;
+      }
+      h1 {
+        color: #333;
+        font-size: 24px;
+      }
+      .camera-box {
+        position: relative;
+        width: 100%;
+        max-width: 500px;
+        margin: 0 auto;
+        border: 3px solid #ddd;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #000;
+      }
+      video {
+        width: 100%;
+        display: block;
+      }
+      .status {
+        margin-top: 15px;
+        font-size: 20px;
+        font-weight: bold;
+        color: #555;
+      }
+      .result-box {
+        margin-top: 20px;
+        padding: 20px;
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        max-width: 500px;
+        margin-left: auto;
+        margin-right: auto;
+      }
+      #magnified-img {
+        width: 100%;
+        max-height: 250px;
+        object-fit: contain;
+        margin-top: 10px;
+        border: 1px solid #ccc;
+        display: none;
+      }
+      #expiry-text {
+        font-size: 48px;
+        font-weight: 900;
+        color: #e60000;
+        margin-top: 15px;
+        word-break: break-all;
+      }
+      /* 로딩 중일 때 깜빡이는 효과 */
+      .loading {
+        animation: blinker 1s linear infinite;
+        color: orange;
+      }
+      @keyframes blinker {
+        50% {
+          opacity: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>💊 약 유통기한 실시간 돋보기</h1>
+
+    <div class="camera-box">
+      <video id="webcam" autoplay playsinline></video>
+    </div>
+
+    <div class="status" id="status-msg">카메라를 켜는 중입니다...</div>
+
+    <div class="result-box">
+      <div>🔍 선명한 돋보기 화면</div>
+      <img id="magnified-img" src="" alt="유통기한 사진" />
+      <div id="expiry-text">날짜를 찾는 중...</div>
+    </div>
+
+    <canvas id="capture-canvas" style="display: none"></canvas>
+    <canvas id="crop-canvas" style="display: none"></canvas>
+
+    <script>
+      // ==========================================
+      // [필수 설정] 여기에 리더님의 API 키를 넣으세요!
+      // ==========================================
+      const API_KEYS = {
+        // 롭오프로우는 클라이언트(브라우저)에서 바로 쏘는 것이므로 Publishable API Key를 쓰는 것이 보안상 안전합니다.
+        ROBOFLOW: '7V6pHoQiA8J5kjO1LCuX',
+        MODEL_ID: 'medicine_date2/1',
+        GOOGLE_VISION: 'AIzaSyCTh9xnrIKWfuglS3BEuaSAAQnjdSQhB0Q',
+      };
+      // ==========================================
+
+      const video = document.getElementById('webcam');
+      const capCanvas = document.getElementById('capture-canvas');
+      const capCtx = capCanvas.getContext('2d');
+      const cropCanvas = document.getElementById('crop-canvas');
+      const cropCtx = cropCanvas.getContext('2d');
+
+      const statusMsg = document.getElementById('status-msg');
+      const magnifiedImg = document.getElementById('magnified-img');
+      const expiryText = document.getElementById('expiry-text');
+
+      let isProcessing = false; // 중복 요청 방지용 잠금장치
+
+      // 1. 스마트폰 후면 카메라 켜기
+      navigator.mediaDevices
+        .getUserMedia({
+          video: {
+            facingMode: 'environment',
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        })
+        .then((stream) => {
+          video.srcObject = stream;
+          video.onloadedmetadata = () => {
+            statusMsg.innerText = '유통기한을 찾는 중...';
+            // 0.8초마다 분석 함수 실행 (프레임 스로틀링)
+            setInterval(processFrame, 800);
+          };
+        })
+        .catch((err) => {
+          statusMsg.innerText = '카메라 권한이 필요합니다.';
+          console.error(err);
+        });
+
+      // 2. 핵심 분석 로직 (0.8초마다 실행)
+      async function processFrame() {
+        // 카메라 준비 안 됨 OR 이미 분석 중이면 건너뜀 (속도 개선 핵심)
+        if (video.videoWidth === 0 || isProcessing) return;
+        isProcessing = true;
+
+        try {
+          // A. 현재 카메라 화면 캡처
+          capCanvas.width = video.videoWidth;
+          capCanvas.height = video.videoHeight;
+          capCtx.drawImage(video, 0, 0);
+
+          // base64 형태로 변환 (data:image/jpeg;base64, 부분 제거)
+          const base64Image = capCanvas
+            .toDataURL('image/jpeg', 0.8)
+            .split(',')[1];
+
+          // B. Roboflow API 직접 호출 (위치 찾기)
+          const roboUrl = `https://detect.roboflow.com/${API_KEYS.MODEL_ID}?api_key=${API_KEYS.ROBOFLOW}`;
+
+          const roboResponse = await fetch(roboUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: base64Image,
+          });
+
+          const roboResult = await roboResponse.json();
+
+          // C. 결과 판단
+          if (!roboResult.predictions || roboResult.predictions.length === 0) {
+            statusMsg.innerText =
+              '사용기한이 인식되지 않습니다. 다른 부분을 비춰주세요';
+            statusMsg.style.color = 'red';
+            isProcessing = false;
+            return; // 못 찾았으면 여기서 종료하고 다음 0.8초를 기다림
+          }
+
+          // D. 유통기한을 찾았을 때 처리
+          statusMsg.innerText =
+            '사용기한이 인식되었습니다. 카메라를 고정해주세요';
+          statusMsg.style.color = 'blue';
+
+          const bestBox = roboResult.predictions.reduce((prev, current) =>
+            prev.confidence > current.confidence ? prev : current,
+          );
+
+          // E. 자바스크립트로 이미지 자르기 (Crop)
+          const padW = bestBox.width * 0.15;
+          const padH = bestBox.height * 0.15;
+          const sx = Math.max(0, bestBox.x - bestBox.width / 2 - padW);
+          const sy = Math.max(0, bestBox.y - bestBox.height / 2 - padH);
+          const sWidth = Math.min(
+            capCanvas.width - sx,
+            bestBox.width + padW * 2,
+          );
+          const sHeight = Math.min(
+            capCanvas.height - sy,
+            bestBox.height + padH * 2,
+          );
+
+          cropCanvas.width = sWidth;
+          cropCanvas.height = sHeight;
+
+          // 이진화, 대비 향상 필터 효과 (CSS 필터 활용)
+          cropCtx.filter = 'grayscale(100%) contrast(300%)';
+          cropCtx.drawImage(
+            capCanvas,
+            sx,
+            sy,
+            sWidth,
+            sHeight,
+            0,
+            0,
+            sWidth,
+            sHeight,
+          );
+
+          const croppedBase64 = cropCanvas.toDataURL('image/jpeg', 0.9);
+          magnifiedImg.src = croppedBase64;
+          magnifiedImg.style.display = 'block';
+          expiryText.innerHTML =
+            "<span class='loading'>구글 AI가 읽는 중...</span>";
+
+          // F. 잘라낸 이미지를 Google Vision API로 직접 전송 (글자 읽기)
+          const cleanCroppedBase64 = croppedBase64.split(',')[1];
+          const googleUrl = `https://vision.googleapis.com/v1/images:annotate?key=${API_KEYS.GOOGLE_VISION}`;
+
+          const googlePayload = {
+            requests: [
+              {
+                image: { content: cleanCroppedBase64 },
+                features: [{ type: 'TEXT_DETECTION' }],
+              },
+            ],
+          };
+
+          const googleResponse = await fetch(googleUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(googlePayload),
+          });
+
+          const googleResult = await googleResponse.json();
+
+          // G. 최종 텍스트 화면에 출력
+          let textFound = '글씨를 감지하지 못했습니다.';
+          if (
+            googleResult.responses &&
+            googleResult.responses[0].textAnnotations
+          ) {
+            textFound = googleResult.responses[0].textAnnotations[0].description
+              .trim()
+              .replace(/\s+/g, ' ');
+          }
+
+          expiryText.innerHTML = textFound;
+        } catch (error) {
+          console.error('통신 오류:', error);
+          statusMsg.innerText = '네트워크 통신 오류가 발생했습니다.';
+        } finally {
+          isProcessing = false; // 락 해제
+        }
+      }
+    </script>
+  </body>
+</html>
